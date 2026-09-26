@@ -20,3 +20,7 @@ if(MSVC)
 endif()
 enable_testing()
 add_test(NAME culling_tests COMMAND culling_tests)
+
+add_executable(lod_tests tests/lod_tests.cpp)
+target_include_directories(lod_tests PRIVATE src)
+add_test(NAME lod_tests COMMAND lod_tests)

@@ -1,4 +1,4 @@
-#include "culling.hpp"
+#include "lod.hpp"
 #include <windows.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
@@ -141,7 +141,7 @@ static std::vector<uint8_t> readTga(const fs::path& path,uint32_t& width,uint32_
 }
 
 static const char* shader=R"(
-cbuffer Camera : register(b0) {float4x4 viewProj; float4 lightDirection;};
+cbuffer Camera : register(b0) {float4x4 viewProj; float4 lightDirection; float4 cameraRight; float4 cameraUp;};
 Texture2D diffuseTexture : register(t0);
 SamplerState textureSampler : register(s0);
 struct VSInput {float3 pos:POSITION;float3 normal:NORMAL;float2 uv:TEXCOORD0;float4 centerScale:INSTANCEPOS;float4 tint:INSTANCECOLOR;};
@@ -153,6 +153,16 @@ PSInput VSMain(VSInput v) {
     o.normal=v.normal;o.uv=v.uv;o.tint=v.tint;
     return o;
 }
+PSInput VSBillboard(VSInput v) {
+    PSInput o;
+    float3 world=v.centerScale.xyz+(cameraRight.xyz*v.pos.x+cameraUp.xyz*v.pos.y)*v.centerScale.w;
+    o.pos=mul(float4(world,1),viewProj);
+    o.normal=0;o.uv=v.uv;o.tint=v.tint;return o;
+}
+float4 PSBillboard(PSInput i):SV_TARGET {
+    float4 color=diffuseTexture.Sample(textureSampler,i.uv)*i.tint;
+    clip(color.a-0.15);return float4(color.rgb,1);
+}
 float4 PSMain(PSInput i):SV_TARGET {
     float4 albedo=diffuseTexture.Sample(textureSampler,i.uv)*i.tint;
     clip(albedo.a-0.15);
@@ -161,7 +171,7 @@ float4 PSMain(PSInput i):SV_TARGET {
 }
 )";
 
-struct CameraBuffer { XMFLOAT4X4 viewProj; XMFLOAT4 lightDirection; };
+struct CameraBuffer { XMFLOAT4X4 viewProj; XMFLOAT4 lightDirection; XMFLOAT4 cameraRight,cameraUp; };
 
 class App {
     HWND hwnd_=nullptr;
@@ -172,13 +182,48 @@ class App {
     ComPtr<ID3D11RenderTargetView> target_;
     ComPtr<ID3D11Texture2D> depthTexture_;
     ComPtr<ID3D11DepthStencilView> depthView_;
-    ComPtr<ID3D11VertexShader> vs_;
-    ComPtr<ID3D11PixelShader> ps_;
+    ComPtr<ID3D11VertexShader> vs_,billboardVs_;
+    ComPtr<ID3D11PixelShader> ps_,billboardPs_;
     ComPtr<ID3D11InputLayout> layout_;
     ComPtr<ID3D11SamplerState> sampler_;
     ComPtr<ID3D11RasterizerState> raster_;
     ComPtr<ID3D11Buffer> cameraBuffer_,modelBuffer_,cubeBuffer_,instanceBuffer_;
-    ComPtr<ID3D11ShaderResourceView> whiteTexture_;
+    ComPtr<ID3D11ShaderResourceView> whiteTexture_,cubeImpostor_,modelImpostor_;
+    ComPtr<ID3D11Buffer> quadBuffer_;
+    Vec3 modelCenter_{};
+    float modelRadius_=1;
+    int forcedLod_=-1;
+    bool selfTest_=false;
+    void verifyFrame() {
+        ComPtr<ID3D11Texture2D> back,staging;
+        check(swap_->GetBuffer(0,IID_PPV_ARGS(&back)),"Test back buffer");
+        D3D11_TEXTURE2D_DESC desc{};back->GetDesc(&desc);
+        desc.Usage=D3D11_USAGE_STAGING;desc.BindFlags=0;desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;desc.MiscFlags=0;
+        check(device_->CreateTexture2D(&desc,nullptr,&staging),"Test staging texture");
+        context_->CopyResource(staging.Get(),back.Get());
+        D3D11_MAPPED_SUBRESOURCE data{};check(context_->Map(staging.Get(),0,D3D11_MAP_READ,0,&data),"Read test frame");
+        size_t pixels=0;
+        for(UINT y=0;y<desc.Height;++y)for(UINT x=0;x<desc.Width;++x) {
+            const auto p=static_cast<const unsigned char*>(data.pData)+y*data.RowPitch+x*4;
+            if(std::abs(int(p[0])-18)>1 || std::abs(int(p[1])-26)>1 || std::abs(int(p[2])-41)>1)++pixels;
+        }
+        // Self-test screenshots also allow visual inspection of each representation.
+        const DWORD rowBytes=(desc.Width*3+3)&~3u;
+        BITMAPFILEHEADER fileHeader{};fileHeader.bfType=0x4d42;fileHeader.bfOffBits=sizeof(BITMAPFILEHEADER)+sizeof(BITMAPINFOHEADER);fileHeader.bfSize=fileHeader.bfOffBits+rowBytes*desc.Height;
+        BITMAPINFOHEADER info{};info.biSize=sizeof(info);info.biWidth=desc.Width;info.biHeight=desc.Height;info.biPlanes=1;info.biBitCount=24;
+        std::ofstream image("lod_"+std::to_string(forcedLod_)+".bmp",std::ios::binary);
+        image.write(reinterpret_cast<const char*>(&fileHeader),sizeof(fileHeader));image.write(reinterpret_cast<const char*>(&info),sizeof(info));
+        std::vector<unsigned char> row(rowBytes);
+        for(UINT y=desc.Height;y>0;--y) {
+            const auto source=static_cast<const unsigned char*>(data.pData)+(y-1)*data.RowPitch;
+            for(UINT x=0;x<desc.Width;++x){row[x*3]=source[x*4+2];row[x*3+1]=source[x*4+1];row[x*3+2]=source[x*4];}
+            image.write(reinterpret_cast<const char*>(row.data()),row.size());
+        }
+        context_->Unmap(staging.Get(),0);
+        std::ofstream log("lod_selftest.txt",std::ios::app);
+        log<<"mode="<<forcedLod_<<" non-background pixels="<<pixels<<"\n";
+        if((forcedLod_==2 && pixels!=0) || (forcedLod_!=2 && pixels<100))throw std::runtime_error("LOD render verification failed");
+    }
     std::vector<Material> materials_;
     Mesh model_;
     std::vector<Vertex> cube_;
@@ -208,6 +253,8 @@ class App {
                 if(!(l&(1u<<30))) {
                     if(w==VK_F1)app->culling_=!app->culling_;
                     if(w==VK_F2)app->octree_=!app->octree_;
+                    if(w==VK_F3)app->forcedLod_=(app->forcedLod_+2)%4-1;
+                    if(w==VK_HOME){app->camera_={0,18,-45};app->yaw_=0;app->pitch_=-0.15f;}
                     if(w==VK_ESCAPE)PostQuitMessage(0);
                 }
                 return 0;
@@ -260,6 +307,9 @@ class App {
         auto vsCode=compile("VSMain","vs_5_0"),psCode=compile("PSMain","ps_5_0");
         check(device_->CreateVertexShader(vsCode->GetBufferPointer(),vsCode->GetBufferSize(),nullptr,&vs_),"Create VS");
         check(device_->CreatePixelShader(psCode->GetBufferPointer(),psCode->GetBufferSize(),nullptr,&ps_),"Create PS");
+        auto bvs=compile("VSBillboard","vs_5_0"),bps=compile("PSBillboard","ps_5_0");
+        check(device_->CreateVertexShader(bvs->GetBufferPointer(),bvs->GetBufferSize(),nullptr,&billboardVs_),"Create billboard VS");
+        check(device_->CreatePixelShader(bps->GetBufferPointer(),bps->GetBufferSize(),nullptr,&billboardPs_),"Create billboard PS");
         const D3D11_INPUT_ELEMENT_DESC elements[]={
             {"POSITION",0,DXGI_FORMAT_R32G32B32_FLOAT,0,0,D3D11_INPUT_PER_VERTEX_DATA,0},
             {"NORMAL",0,DXGI_FORMAT_R32G32B32_FLOAT,0,12,D3D11_INPUT_PER_VERTEX_DATA,0},
@@ -298,7 +348,7 @@ class App {
             if(std::abs(px)<23 && std::abs(pz)<17)continue;
             const float size=scale(rng),height=0.7f+size*0.5f;
             objects_.push_back({px,height,pz,size,color(rng),color(rng),color(rng),1});
-            const float h=size*0.5f;
+            const float h=size*1.3f; // covers cube and rotating billboard
             boxes_.push_back({{px-h,height-h,pz-h},{px+h,height+h,pz+h}});
         }
         tree_.build(boxes_);
@@ -315,6 +365,56 @@ class App {
             mat.texture=pixels.empty()?whiteTexture_:makeTexture(pixels.data(),w,h);
         }
         makeCube();buildObjects();
+        modelCenter_={(model_.bounds.min.x+model_.bounds.max.x)*0.5f,(model_.bounds.min.y+model_.bounds.max.y)*0.5f,(model_.bounds.min.z+model_.bounds.max.z)*0.5f};
+        const float dx=model_.bounds.max.x-model_.bounds.min.x,dy=model_.bounds.max.y-model_.bounds.min.y,dz=model_.bounds.max.z-model_.bounds.min.z;
+        modelRadius_=0.51f*std::sqrt(dx*dx+dy*dy+dz*dz);
+        std::vector<Vertex> quad{
+            {-.5f,.5f,0,0,0,-1,0,0},{.5f,.5f,0,0,0,-1,1,0},{.5f,-.5f,0,0,0,-1,1,1},
+            {-.5f,.5f,0,0,0,-1,0,0},{.5f,-.5f,0,0,0,-1,1,1},{-.5f,-.5f,0,0,0,-1,0,1}};
+        quadBuffer_=makeImmutableVertexBuffer(quad);
+        cubeImpostor_=captureImpostor(false,{0,0,0},0.9f,256);
+        modelImpostor_=captureImpostor(true,modelCenter_,modelRadius_,1024);
+        resize();
+    }
+    // Bake geometry once. Background alpha remains zero, geometry writes alpha one.
+    ComPtr<ID3D11ShaderResourceView> captureImpostor(bool model,Vec3 center,float radius,UINT resolution) {
+        D3D11_TEXTURE2D_DESC td{};td.Width=td.Height=resolution;td.MipLevels=1;td.ArraySize=1;
+        td.Format=DXGI_FORMAT_R8G8B8A8_UNORM;td.SampleDesc.Count=1;td.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE;
+        ComPtr<ID3D11Texture2D> texture,depth;
+        check(device_->CreateTexture2D(&td,nullptr,&texture),"Create impostor texture");
+        ComPtr<ID3D11RenderTargetView> rtv;check(device_->CreateRenderTargetView(texture.Get(),nullptr,&rtv),"Create impostor RTV");
+        ComPtr<ID3D11ShaderResourceView> srv;check(device_->CreateShaderResourceView(texture.Get(),nullptr,&srv),"Create impostor SRV");
+        td.Format=DXGI_FORMAT_D24_UNORM_S8_UINT;td.BindFlags=D3D11_BIND_DEPTH_STENCIL;
+        check(device_->CreateTexture2D(&td,nullptr,&depth),"Create impostor depth");
+        ComPtr<ID3D11DepthStencilView> dsv;check(device_->CreateDepthStencilView(depth.Get(),nullptr,&dsv),"Create impostor DSV");
+        const float transparent[4]={0,0,0,0};context_->ClearRenderTargetView(rtv.Get(),transparent);
+        context_->ClearDepthStencilView(dsv.Get(),D3D11_CLEAR_DEPTH,1,0);
+        auto target=rtv.Get();context_->OMSetRenderTargets(1,&target,dsv.Get());
+        D3D11_VIEWPORT viewport{0,0,float(resolution),float(resolution),0,1};context_->RSSetViewports(1,&viewport);
+        const auto focus=XMVectorSet(center.x,center.y,center.z,1);
+        const auto offset=XMVectorScale(XMVector3Normalize(XMVectorSet(1,0.65f,-1,0)),radius*3);
+        auto view=XMMatrixLookAtLH(XMVectorAdd(focus,offset),focus,XMVectorSet(0,1,0,0));
+        CameraBuffer cb{};XMStoreFloat4x4(&cb.viewProj,XMMatrixTranspose(view*XMMatrixOrthographicLH(radius*2,radius*2,0.1f,radius*6)));
+        cb.lightDirection={-0.4f,-1,-0.3f,0};context_->UpdateSubresource(cameraBuffer_.Get(),0,nullptr,&cb,0,0);
+        ID3D11Buffer* constants=cameraBuffer_.Get();context_->VSSetConstantBuffers(0,1,&constants);context_->PSSetConstantBuffers(0,1,&constants);
+        context_->RSSetState(raster_.Get());context_->IASetInputLayout(layout_.Get());context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context_->VSSetShader(vs_.Get(),nullptr,0);context_->PSSetShader(ps_.Get(),nullptr,0);
+        auto sampler=sampler_.Get();context_->PSSetSamplers(0,1,&sampler);
+        uploadInstances({Instance{0,0,0,1,1,1,1,1}});
+        ID3D11Buffer* buffers[]={model?modelBuffer_.Get():cubeBuffer_.Get(),instanceBuffer_.Get()};UINT strides[]={sizeof(Vertex),sizeof(Instance)},offsets[]={0,0};
+        context_->IASetVertexBuffers(0,2,buffers,strides,offsets);
+        if(model)for(const auto& batch:model_.batches){auto tex=materials_[batch.material].texture.Get();context_->PSSetShaderResources(0,1,&tex);context_->DrawInstanced(batch.count,1,batch.first,0);}
+        else {auto tex=whiteTexture_.Get();context_->PSSetShaderResources(0,1,&tex);context_->DrawInstanced(static_cast<UINT>(cube_.size()),1,0,0);}
+        context_->OMSetRenderTargets(0,nullptr,nullptr);
+        return srv;
+    }
+    void drawBillboards(const std::vector<Instance>& instances,ID3D11ShaderResourceView* texture) {
+        if(instances.empty())return;
+        uploadInstances(instances);
+        context_->VSSetShader(billboardVs_.Get(),nullptr,0);context_->PSSetShader(billboardPs_.Get(),nullptr,0);
+        ID3D11Buffer* buffers[]={quadBuffer_.Get(),instanceBuffer_.Get()};UINT strides[]={sizeof(Vertex),sizeof(Instance)},offsets[]={0,0};
+        context_->IASetVertexBuffers(0,2,buffers,strides,offsets);context_->PSSetShaderResources(0,1,&texture);
+        context_->DrawInstanced(6,static_cast<UINT>(instances.size()),0,0);
     }
     void updateCamera(float dt) {
         const float turn=1.7f*dt;
@@ -364,6 +464,8 @@ class App {
         const Frustum frustum=Frustum::fromMatrix(matrix);
         selectVisible(frustum);
         CameraBuffer camera{};XMStoreFloat4x4(&camera.viewProj,XMMatrixTranspose(vp));camera.lightDirection={-0.4f,-1.f,-0.3f,0};
+        camera.cameraRight={std::cos(yaw_),0,-std::sin(yaw_),0};
+        camera.cameraUp={-std::sin(pitch_)*std::sin(yaw_),std::cos(pitch_),-std::sin(pitch_)*std::cos(yaw_),0};
         context_->UpdateSubresource(cameraBuffer_.Get(),0,nullptr,&camera,0,0);
         const float clear[4]={0.07f,0.10f,0.16f,1};
         context_->ClearRenderTargetView(target_.Get(),clear);
@@ -371,10 +473,13 @@ class App {
         ID3D11RenderTargetView* rtv=target_.Get();context_->OMSetRenderTargets(1,&rtv,depthView_.Get());
         context_->RSSetState(raster_.Get());context_->IASetInputLayout(layout_.Get());context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         context_->VSSetShader(vs_.Get(),nullptr,0);context_->PSSetShader(ps_.Get(),nullptr,0);
-        ID3D11Buffer* cb=cameraBuffer_.Get();context_->VSSetConstantBuffers(0,1,&cb);
+        ID3D11Buffer* cb=cameraBuffer_.Get();context_->VSSetConstantBuffers(0,1,&cb);context_->PSSetConstantBuffers(0,1,&cb);
         ID3D11SamplerState* sampler=sampler_.Get();context_->PSSetSamplers(0,1,&sampler);
-        const bool modelVisible=!culling_ || frustum.classify(model_.bounds)!=Relation::Outside;
-        if(modelVisible) {
+        const Lod modelLod=selectLod(camera_,modelCenter_,60.f,150.f,forcedLod_);
+        const float r=modelRadius_*1.415f;
+        const Aabb billboardBounds{{modelCenter_.x-r,modelCenter_.y-r,modelCenter_.z-r},{modelCenter_.x+r,modelCenter_.y+r,modelCenter_.z+r}};
+        const bool modelVisible=!culling_ || frustum.classify(modelLod==Lod::Billboard?billboardBounds:model_.bounds)!=Relation::Outside;
+        if(modelVisible && modelLod==Lod::Model) {
             uploadInstances({Instance{0,0,0,1,1,1,1,1}});
             ID3D11Buffer* buffers[]={modelBuffer_.Get(),instanceBuffer_.Get()};UINT strides[]={sizeof(Vertex),sizeof(Instance)},offsets[]={0,0};
             context_->IASetVertexBuffers(0,2,buffers,strides,offsets);
@@ -384,15 +489,28 @@ class App {
                 context_->DrawInstanced(batch.count,1,batch.first,0);
             }
         }
-        if(!visible_.empty()) {
-            std::vector<Instance> instances;instances.reserve(visible_.size());
-            for(uint32_t id:visible_)instances.push_back(objects_[id]);
+        std::vector<Instance> nearInstances,billboardInstances;
+        size_t hiddenCount=0;
+        for(uint32_t id:visible_) {
+            const auto& o=objects_[id];
+            switch(selectLod(camera_,{o.x,o.y,o.z},30.f,85.f,forcedLod_)) {
+                case Lod::Model:nearInstances.push_back(o);break;
+                case Lod::Billboard:{auto b=o;b.scale*=1.8f;billboardInstances.push_back(b);break;}
+                case Lod::Hidden:++hiddenCount;break;
+            }
+        }
+        if(!nearInstances.empty()) {
+            const auto& instances=nearInstances;
             uploadInstances(instances);
             ID3D11Buffer* buffers[]={cubeBuffer_.Get(),instanceBuffer_.Get()};UINT strides[]={sizeof(Vertex),sizeof(Instance)},offsets[]={0,0};
             context_->IASetVertexBuffers(0,2,buffers,strides,offsets);
             ID3D11ShaderResourceView* white=whiteTexture_.Get();context_->PSSetShaderResources(0,1,&white);
             context_->DrawInstanced(static_cast<UINT>(cube_.size()),static_cast<UINT>(instances.size()),0,0);
         }
+        drawBillboards(billboardInstances,cubeImpostor_.Get());
+        if(modelVisible && modelLod==Lod::Billboard)
+            drawBillboards({Instance{modelCenter_.x,modelCenter_.y,modelCenter_.z,modelRadius_*2,1,1,1,1}},modelImpostor_.Get());
+        if(selfTest_)verifyFrame();
         check(swap_->Present(1,0),"Present");
         ++frames_;
         const auto now=std::chrono::steady_clock::now();
@@ -401,21 +519,31 @@ class App {
             fps_=frames_/elapsed;frames_=0;fpsStart_=now;
             std::wostringstream title;
             title<<L"CG Homework 4 | "<<(culling_?(octree_?L"Frustum + Octree":L"Frustum only"):L"No culling")
-                 <<L" | visible "<<visible_.size()<<L"/"<<objects_.size()
+                 <<L" | LOD "<<(forcedLod_<0?L"Auto":forcedLod_==0?L"0":forcedLod_==1?L"1":L"2")
+                 <<L" | cubes 0/1/2: "<<nearInstances.size()<<L"/"<<billboardInstances.size()<<L"/"<<hiddenCount
+                 <<L" | Sponza: "<<static_cast<int>(modelLod)
                  <<L" | AABB tests "<<stats_.objectsTested<<L" | nodes "<<stats_.nodesTested
                  <<L" | FPS "<<std::fixed<<std::setprecision(1)<<fps_
-                 <<L" | F1 culling, F2 octree, WASD move, RMB look";
+                 <<L" | F1/F2 culling, F3 LOD, Home overview";
             SetWindowTextW(hwnd_,title.str().c_str());
         }
     }
 public:
     int run(HINSTANCE instance) {
+        selfTest_=std::wstring(GetCommandLineW()).find(L"--self-test")!=std::wstring::npos;
         WNDCLASSEXW wc{};wc.cbSize=sizeof(wc);wc.lpfnWndProc=windowProc;wc.hInstance=instance;wc.lpszClassName=L"CGHomework4Window";wc.hCursor=LoadCursor(nullptr,IDC_ARROW);wc.style=CS_HREDRAW|CS_VREDRAW;
         if(!RegisterClassExW(&wc))throw std::runtime_error("RegisterClassEx failed");
         hwnd_=CreateWindowExW(0,wc.lpszClassName,L"CG Homework 4",WS_OVERLAPPEDWINDOW,CW_USEDEFAULT,CW_USEDEFAULT,1280,720,nullptr,nullptr,instance,this);
         if(!hwnd_)throw std::runtime_error("CreateWindowEx failed");
-        ShowWindow(hwnd_,SW_SHOW);UpdateWindow(hwnd_);
+        if(!selfTest_){ShowWindow(hwnd_,SW_SHOW);UpdateWindow(hwnd_);}
         initGraphics();loadScene();
+        if(selfTest_) {
+            std::ofstream("lod_selftest.txt")<<"D3D11 render verification\n";
+            camera_={0,18,-45};yaw_=0;pitch_=-0.15f;
+            for(int mode=-1;mode<=2;++mode){forcedLod_=mode;draw(0);}
+            std::ofstream("lod_selftest.txt",std::ios::app)<<"PASS\n";
+            return 0;
+        }
         auto previous=std::chrono::steady_clock::now();
         MSG msg{};
         while(true) {
@@ -432,5 +560,11 @@ public:
 
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int) {
     try {App app;return app.run(instance);}
-    catch(const std::exception& e) {MessageBoxA(nullptr,e.what(),"CG Homework 4 error",MB_ICONERROR);return 1;}
+    catch(const std::exception& e) {
+        if(std::wstring(GetCommandLineW()).find(L"--self-test")!=std::wstring::npos)std::ofstream("lod_selftest.txt",std::ios::app)<<"FAIL: "<<e.what()<<"\n";
+        else MessageBoxA(nullptr,e.what(),"CG Homework 4 error",MB_ICONERROR);
+        return 1;
+    }
 }
+
+
