@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "CG2\\x64\\Debug\\main.obj",
+            "outputs": [
+                "CG2\\x64\\Debug\\main.cpp.obj.dt.module.json",
+                "CG2\\x64\\Debug\\main.cpp.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}
