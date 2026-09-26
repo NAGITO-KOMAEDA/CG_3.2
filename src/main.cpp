@@ -184,6 +184,13 @@ public:
         camera={x,y,z}; yaw=heading;
     }
     void SetLevelView(bool enabled) { showLevels=enabled; }
+    void SetTestView(const std::string& mode, float seconds) {
+        showLevels=mode=="lod";
+        wireframe=mode=="wire";
+        waterVisible=mode!="dry";
+        tessEnabled=mode!="flat";
+        waterTime=seconds;
+    }
     void Run(bool smokeTest=false) {
         root = FindRoot();
         smoke = smokeTest;
@@ -191,6 +198,7 @@ public:
         CreateShaders();
         CreateStates();
         LoadScene();
+        CreateWater();
         if (smoke) { Render(); return; }
         auto last = std::chrono::steady_clock::now();
         MSG message{};
@@ -235,6 +243,12 @@ private:
     ComPtr<ID3D11Buffer> frameBuffer, materialBuffer;
     ComPtr<ID3D11SamplerState> sampler;
     ComPtr<ID3D11RasterizerState> solidState, wireState;
+    ComPtr<ID3D11BlendState> waterBlend;
+    ComPtr<ID3D11DepthStencilState> waterDepth;
+    ComPtr<ID3D11Buffer> waterBuffer;
+    UINT waterVertexCount=0;
+    float waterTime=0.0f, waterOpacity=0.26f;
+    bool waterVisible=true, waterPaused=false;
     ComPtr<ID3D11ShaderResourceView> whiteTexture, flatNormal, neutralHeight;
     std::unordered_map<std::wstring,ComPtr<ID3D11ShaderResourceView>> textureCache;
     std::vector<Material> materials;
@@ -460,6 +474,22 @@ private:
         Check(device->CreateRasterizerState(&rd,solidState.GetAddressOf()),"Create solid rasterizer");
         rd.FillMode=D3D11_FILL_WIREFRAME;
         Check(device->CreateRasterizerState(&rd,wireState.GetAddressOf()),"Create wire rasterizer");
+        D3D11_BLEND_DESC blend{};
+        auto& target=blend.RenderTarget[0];
+        target.BlendEnable=TRUE;
+        target.SrcBlend=D3D11_BLEND_SRC_ALPHA;
+        target.DestBlend=D3D11_BLEND_INV_SRC_ALPHA;
+        target.BlendOp=D3D11_BLEND_OP_ADD;
+        target.SrcBlendAlpha=D3D11_BLEND_ONE;
+        target.DestBlendAlpha=D3D11_BLEND_ZERO;
+        target.BlendOpAlpha=D3D11_BLEND_OP_ADD;
+        target.RenderTargetWriteMask=D3D11_COLOR_WRITE_ENABLE_ALL;
+        Check(device->CreateBlendState(&blend,waterBlend.GetAddressOf()),"Create water blend");
+        D3D11_DEPTH_STENCIL_DESC depth{};
+        depth.DepthEnable=TRUE;
+        depth.DepthWriteMask=D3D11_DEPTH_WRITE_MASK_ZERO;
+        depth.DepthFunc=D3D11_COMPARISON_LESS_EQUAL;
+        Check(device->CreateDepthStencilState(&depth,waterDepth.GetAddressOf()),"Create water depth");
         whiteTexture=Texture({255,255,255,255},1,1,true);
         flatNormal=Texture({128,128,255,255},1,1,false);
         neutralHeight=Texture({128,128,128,255},1,1,false);
@@ -609,7 +639,53 @@ private:
         }
     }
 
+    void CreateWater() {
+        // Shallow water across the central courtyard, above the stone floor.
+        // Regular 0.5 m patches keep the distance-based LOD spatially uniform.
+        std::vector<Vertex> vertices;
+        auto vertex=[](float x,float z) {
+            return Vertex{{x,0.38f,z},{0,1,0},{1,0,0,1},{x,z}};
+        };
+        for (int z=0;z<18;++z) for (int x=0;x<44;++x) {
+            const float px=-11.0f+x*0.5f, pz=-4.5f+z*0.5f;
+            Vertex a=vertex(px,pz), b=vertex(px+0.5f,pz);
+            Vertex c=vertex(px,pz+0.5f), d=vertex(px+0.5f,pz+0.5f);
+            vertices.insert(vertices.end(),{a,c,b,b,c,d});
+        }
+        waterVertexCount=static_cast<UINT>(vertices.size());
+        D3D11_BUFFER_DESC desc{};
+        desc.Usage=D3D11_USAGE_IMMUTABLE;
+        desc.BindFlags=D3D11_BIND_VERTEX_BUFFER;
+        desc.ByteWidth=waterVertexCount*sizeof(Vertex);
+        D3D11_SUBRESOURCE_DATA data{};
+        data.pSysMem=vertices.data();
+        Check(device->CreateBuffer(&desc,&data,waterBuffer.GetAddressOf()),"Create water mesh");
+    }
+
+    void DrawWater() {
+        if (!waterVisible) return;
+        MaterialConstants water{{1.0f,0.0f,1.0f,waterOpacity}};
+        context->UpdateSubresource(materialBuffer.Get(),0,nullptr,&water,0,0);
+        context->OMSetBlendState(waterBlend.Get(),nullptr,0xffffffff);
+        context->OMSetDepthStencilState(waterDepth.Get(),0);
+        context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
+        context->VSSetShader(controlVS.Get(),nullptr,0);
+        context->HSSetShader(hullShader.Get(),nullptr,0);
+        context->DSSetShader(domainShader.Get(),nullptr,0);
+        UINT stride=sizeof(Vertex),offset=0;
+        ID3D11Buffer* vb=waterBuffer.Get();
+        context->IASetVertexBuffers(0,1,&vb,&stride,&offset);
+        context->Draw(waterVertexCount,0);
+        context->OMSetBlendState(nullptr,nullptr,0xffffffff);
+        context->OMSetDepthStencilState(nullptr,0);
+    }
+
     void Update(float dt) {
+        if (GetAsyncKeyState('R')&1) waterVisible=!waterVisible;
+        if (GetAsyncKeyState('P')&1) waterPaused=!waterPaused;
+        if (GetAsyncKeyState('Z')&0x8000) waterOpacity=std::max(0.05f,waterOpacity-dt*0.25f);
+        if (GetAsyncKeyState('X')&0x8000) waterOpacity=std::min(0.75f,waterOpacity+dt*0.25f);
+        if (!waterPaused) waterTime+=dt;
         if (GetAsyncKeyState(VK_ESCAPE)&1) PostQuitMessage(0);
         if (GetAsyncKeyState('T')&1) tessEnabled=!tessEnabled;
         if (GetAsyncKeyState('F')&1) wireframe=!wireframe;
@@ -629,8 +705,8 @@ private:
         titleTimer+=dt;
         if (titleTimer>0.4) {
             wchar_t title[256];
-            swprintf_s(title,L"Sponza | T: %s | F: wireframe | L: LOD colors | +/-: max %.0f | WASD + mouse",
-                       tessEnabled ? L"on" : L"off",maximumTess);
+            swprintf_s(title,L"Sponza | T: %s | F: wire | L: LOD | +/-: %.0f | R: water | P: pause | Z/X: opacity %.2f",
+                       tessEnabled ? L"on" : L"off",maximumTess,waterOpacity);
             SetWindowTextW(window,title);
             titleTimer=0.0;
         }
@@ -671,7 +747,7 @@ private:
         frame.cameraPosition={camera.x,camera.y,camera.z,1};
         frame.lightDirection={-0.45f,-0.8f,0.35f,0};
         frame.tessellation={maximumTess,1.0f,18.0f,tessEnabled ? 1.0f : 0.0f};
-        frame.display={wireframe ? 1.0f : 0.0f,showLevels ? 1.0f : 0.0f,0,0};
+        frame.display={wireframe ? 1.0f : 0.0f,showLevels ? 1.0f : 0.0f,waterTime,0};
         context->UpdateSubresource(frameBuffer.Get(),0,nullptr,&frame,0,0);
         ID3D11Buffer* frameCB=frameBuffer.Get();
         ID3D11Buffer* materialCB=materialBuffer.Get();
@@ -713,6 +789,7 @@ private:
             mat.buffer->GetDesc(&description);
             context->Draw(description.ByteWidth/sizeof(Vertex),0);
         }
+        DrawWater();
         if (msaaSamples>1) {
             context->OMSetRenderTargets(0,nullptr,nullptr);
             ComPtr<ID3D11Texture2D> back;
@@ -755,7 +832,8 @@ int main(int argc, char** argv) {
         App app;
         if (smoke && argc>=6) app.SetCamera(std::stof(argv[2]),std::stof(argv[3]),
                                             std::stof(argv[4]),std::stof(argv[5]));
-        if (smoke && argc>=7 && std::string(argv[6])=="lod") app.SetLevelView(true);
+        if (smoke && argc>=7)
+            app.SetTestView(argv[6],argc>=8 ? std::stof(argv[7]) : 0.0f);
         app.Run(smoke);
     }
     catch (const std::exception& error) {

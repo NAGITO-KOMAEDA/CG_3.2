@@ -6,12 +6,12 @@ cbuffer Frame : register(b0)
     float4 cameraPosition;
     float4 lightDirection;
     float4 tessellation; // x=maximum, y=near distance, z=far distance, w=enabled
-    float4 display;      // x=wireframe (rasterizer), y=show tess levels
+    float4 display;      // x=wireframe, y=show tess levels, z=animation seconds
 };
 
 cbuffer Material : register(b1)
 {
-    float4 material;     // x=displacement strength, y=has normal map
+    float4 material;     // x=displacement strength, y=has normal map, z=water, w=opacity
 };
 
 Texture2D diffuseMap : register(t0);
@@ -73,6 +73,24 @@ struct PatchData
     float inside : SV_InsideTessFactor;
 };
 
+// Height and analytic derivatives of a continuous world-space wave field.
+// Shared patch boundaries evaluate exactly the same displacement.
+float3 WaterWave(float2 p)
+{
+    float3 wave = 0.0;
+    const float2 directions[3] = {float2(1,0), float2(0.6,0.8), float2(-0.8,0.6)};
+    const float amplitudes[3] = {0.065, 0.035, 0.018};
+    const float frequencies[3] = {2.4, 4.1, 7.3};
+    const float speeds[3] = {1.3, 1.8, 2.5};
+    [unroll] for (int j=0; j<3; ++j)
+    {
+        float phase = dot(p,directions[j])*frequencies[j] - display.z*speeds[j];
+        wave.x += amplitudes[j]*sin(phase);
+        wave.yz += amplitudes[j]*frequencies[j]*cos(phase)*directions[j];
+    }
+    return wave;
+}
+
 float EdgeFactor(float3 a, float3 b)
 {
     if (tessellation.w < 0.5 || material.x <= 0.0) return 1.0;
@@ -122,7 +140,14 @@ PixelInput DSMain(PatchData factors, float3 barycentric : SV_DomainLocation,
         uv += patch[i].uv * barycentric[i];
     }
     normal = normalize(normal);
-    if (tessellation.w > 0.5 && material.x > 0.0)
+    if (material.z > 0.5)
+    {
+        float3 wave = WaterWave(position.xz);
+        position.y += wave.x;
+        normal = normalize(float3(-wave.y, 1.0, -wave.z));
+        tangent = normalize(float3(1.0, wave.y, 0.0));
+    }
+    else if (tessellation.w > 0.5 && material.x > 0.0)
     {
         // Explicit LOD is required in the domain shader: implicit derivatives
         // are unavailable at this stage of the pipeline.
@@ -142,6 +167,25 @@ PixelInput DSMain(PatchData factors, float3 barycentric : SV_DomainLocation,
 
 float4 PSMain(PixelInput input) : SV_TARGET
 {
+    if (material.z > 0.5)
+    {
+        float3 wave = WaterWave(input.worldPosition.xz);
+        float3 N = normalize(float3(-wave.y, 1.0, -wave.z));
+        float3 V = normalize(cameraPosition.xyz-input.worldPosition);
+        if (dot(N,V)<0.0) N=-N;
+        float3 L = normalize(-lightDirection.xyz);
+        float fresnel = 0.02 + 0.98*pow(1.0-saturate(dot(N,V)),5.0);
+        float highlight = pow(saturate(dot(N,normalize(L+V))),160.0);
+        float3 color = lerp(float3(0.025,0.22,0.27),float3(0.38,0.58,0.72),fresnel);
+        color += highlight*0.8;
+        if (display.y > 0.5)
+        {
+            float t=saturate((input.tessLevel-1.0)/max(tessellation.x-1.0,1.0));
+            color=lerp(float3(0.1,0.25,0.95),float3(1.0,0.2,0.1),t);
+        }
+        return float4(pow(saturate(color),1.0/2.2),
+                      saturate(material.w+0.35*fresnel+0.15*highlight));
+    }
     float4 albedo = diffuseMap.Sample(textureSampler, input.uv);
     clip(albedo.a - 0.35);
 
