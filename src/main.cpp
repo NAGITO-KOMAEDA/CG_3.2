@@ -188,7 +188,7 @@ class App {
     ComPtr<ID3D11SamplerState> sampler_;
     ComPtr<ID3D11RasterizerState> raster_;
     ComPtr<ID3D11Buffer> cameraBuffer_,modelBuffer_,cubeBuffer_,instanceBuffer_;
-    ComPtr<ID3D11ShaderResourceView> whiteTexture_,cubeImpostor_,modelImpostor_;
+    ComPtr<ID3D11ShaderResourceView> whiteTexture_,lionTexture_;
     ComPtr<ID3D11Buffer> quadBuffer_;
     Vec3 modelCenter_{};
     float modelRadius_=1;
@@ -372,41 +372,11 @@ class App {
             {-.5f,.5f,0,0,0,-1,0,0},{.5f,.5f,0,0,0,-1,1,0},{.5f,-.5f,0,0,0,-1,1,1},
             {-.5f,.5f,0,0,0,-1,0,0},{.5f,-.5f,0,0,0,-1,1,1},{-.5f,-.5f,0,0,0,-1,0,1}};
         quadBuffer_=makeImmutableVertexBuffer(quad);
-        cubeImpostor_=captureImpostor(false,{0,0,0},0.9f,256);
-        modelImpostor_=captureImpostor(true,modelCenter_,modelRadius_,1024);
+        uint32_t lionWidth=0,lionHeight=0;
+        auto lionPixels=readTga(assets/L"textures"/L"lion.tga",lionWidth,lionHeight);
+        if(lionPixels.empty())throw std::runtime_error("Cannot load textures/lion.tga for billboards");
+        lionTexture_=makeTexture(lionPixels.data(),lionWidth,lionHeight);
         resize();
-    }
-    // Bake geometry once. Background alpha remains zero, geometry writes alpha one.
-    ComPtr<ID3D11ShaderResourceView> captureImpostor(bool model,Vec3 center,float radius,UINT resolution) {
-        D3D11_TEXTURE2D_DESC td{};td.Width=td.Height=resolution;td.MipLevels=1;td.ArraySize=1;
-        td.Format=DXGI_FORMAT_R8G8B8A8_UNORM;td.SampleDesc.Count=1;td.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE;
-        ComPtr<ID3D11Texture2D> texture,depth;
-        check(device_->CreateTexture2D(&td,nullptr,&texture),"Create impostor texture");
-        ComPtr<ID3D11RenderTargetView> rtv;check(device_->CreateRenderTargetView(texture.Get(),nullptr,&rtv),"Create impostor RTV");
-        ComPtr<ID3D11ShaderResourceView> srv;check(device_->CreateShaderResourceView(texture.Get(),nullptr,&srv),"Create impostor SRV");
-        td.Format=DXGI_FORMAT_D24_UNORM_S8_UINT;td.BindFlags=D3D11_BIND_DEPTH_STENCIL;
-        check(device_->CreateTexture2D(&td,nullptr,&depth),"Create impostor depth");
-        ComPtr<ID3D11DepthStencilView> dsv;check(device_->CreateDepthStencilView(depth.Get(),nullptr,&dsv),"Create impostor DSV");
-        const float transparent[4]={0,0,0,0};context_->ClearRenderTargetView(rtv.Get(),transparent);
-        context_->ClearDepthStencilView(dsv.Get(),D3D11_CLEAR_DEPTH,1,0);
-        auto target=rtv.Get();context_->OMSetRenderTargets(1,&target,dsv.Get());
-        D3D11_VIEWPORT viewport{0,0,float(resolution),float(resolution),0,1};context_->RSSetViewports(1,&viewport);
-        const auto focus=XMVectorSet(center.x,center.y,center.z,1);
-        const auto offset=XMVectorScale(XMVector3Normalize(XMVectorSet(1,0.65f,-1,0)),radius*3);
-        auto view=XMMatrixLookAtLH(XMVectorAdd(focus,offset),focus,XMVectorSet(0,1,0,0));
-        CameraBuffer cb{};XMStoreFloat4x4(&cb.viewProj,XMMatrixTranspose(view*XMMatrixOrthographicLH(radius*2,radius*2,0.1f,radius*6)));
-        cb.lightDirection={-0.4f,-1,-0.3f,0};context_->UpdateSubresource(cameraBuffer_.Get(),0,nullptr,&cb,0,0);
-        ID3D11Buffer* constants=cameraBuffer_.Get();context_->VSSetConstantBuffers(0,1,&constants);context_->PSSetConstantBuffers(0,1,&constants);
-        context_->RSSetState(raster_.Get());context_->IASetInputLayout(layout_.Get());context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        context_->VSSetShader(vs_.Get(),nullptr,0);context_->PSSetShader(ps_.Get(),nullptr,0);
-        auto sampler=sampler_.Get();context_->PSSetSamplers(0,1,&sampler);
-        uploadInstances({Instance{0,0,0,1,1,1,1,1}});
-        ID3D11Buffer* buffers[]={model?modelBuffer_.Get():cubeBuffer_.Get(),instanceBuffer_.Get()};UINT strides[]={sizeof(Vertex),sizeof(Instance)},offsets[]={0,0};
-        context_->IASetVertexBuffers(0,2,buffers,strides,offsets);
-        if(model)for(const auto& batch:model_.batches){auto tex=materials_[batch.material].texture.Get();context_->PSSetShaderResources(0,1,&tex);context_->DrawInstanced(batch.count,1,batch.first,0);}
-        else {auto tex=whiteTexture_.Get();context_->PSSetShaderResources(0,1,&tex);context_->DrawInstanced(static_cast<UINT>(cube_.size()),1,0,0);}
-        context_->OMSetRenderTargets(0,nullptr,nullptr);
-        return srv;
     }
     void drawBillboards(const std::vector<Instance>& instances,ID3D11ShaderResourceView* texture) {
         if(instances.empty())return;
@@ -495,7 +465,7 @@ class App {
             const auto& o=objects_[id];
             switch(selectLod(camera_,{o.x,o.y,o.z},30.f,85.f,forcedLod_)) {
                 case Lod::Model:nearInstances.push_back(o);break;
-                case Lod::Billboard:{auto b=o;b.scale*=1.8f;billboardInstances.push_back(b);break;}
+                case Lod::Billboard:{auto b=o;b.scale*=1.8f;b.r=b.g=b.b=b.a=1.f;billboardInstances.push_back(b);break;}
                 case Lod::Hidden:++hiddenCount;break;
             }
         }
@@ -507,9 +477,9 @@ class App {
             ID3D11ShaderResourceView* white=whiteTexture_.Get();context_->PSSetShaderResources(0,1,&white);
             context_->DrawInstanced(static_cast<UINT>(cube_.size()),static_cast<UINT>(instances.size()),0,0);
         }
-        drawBillboards(billboardInstances,cubeImpostor_.Get());
+        drawBillboards(billboardInstances,lionTexture_.Get());
         if(modelVisible && modelLod==Lod::Billboard)
-            drawBillboards({Instance{modelCenter_.x,modelCenter_.y,modelCenter_.z,modelRadius_*2,1,1,1,1}},modelImpostor_.Get());
+            drawBillboards({Instance{modelCenter_.x,modelCenter_.y,modelCenter_.z,modelRadius_*2,1,1,1,1}},lionTexture_.Get());
         if(selfTest_)verifyFrame();
         check(swap_->Present(1,0),"Present");
         ++frames_;
@@ -566,5 +536,6 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int) {
         return 1;
     }
 }
+
 
 
