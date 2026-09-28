@@ -1,5 +1,5 @@
-/build*/
+/build/
 /.vs/
-/out/
 *.user
-smoke-test-error.txt
+*.suo
+
